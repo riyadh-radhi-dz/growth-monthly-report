@@ -139,9 +139,10 @@ prev_month_check AS (
 
 classified AS (
     SELECT
-        t.customer_id  AS customer_id,
-        t.report_month AS report_month,
-        t.total_price  AS total_price,
+        t.customer_id             AS customer_id,
+        t.report_month            AS report_month,
+        t.total_price             AS total_price,
+        fp.first_purchase_month   AS first_purchase_month,
         multiIf(
             fp.first_purchase_month = t.report_month AND s.signup_month = t.report_month,
                 'new_same_month',
@@ -169,7 +170,7 @@ agg AS (
         sum(total_price)                                                                         AS gross_sales,
         sumIf(total_price, segment = 'new_same_month')                                          AS rev_new_same_month,
         sumIf(total_price, segment = 'new_prev_month')                                          AS rev_new_prev_month,
-        sumIf(total_price, segment IN ('new_same_month', 'new_prev_month', 'harvested_new'))    AS rev_new_all,
+        sumIf(total_price, first_purchase_month >= addMonths(report_month, -1))                 AS rev_new_all,
         sumIf(total_price, segment = 'existing_retained')                                       AS rev_existing_retained,
         sumIf(total_price, segment = 'existing_reactivated')                                    AS rev_existing_reactivated,
         sumIf(total_price, segment IN ('existing_retained', 'existing_reactivated'))            AS rev_existing_all,
@@ -310,6 +311,26 @@ ORDER BY report_month, transformed_category
 SETTINGS allow_experimental_analyzer = 1
 """
 
+Q5_SQL = """
+WITH
+signups_dedup AS (
+    SELECT customer_id, toStartOfMonth(MIN(system_created_at)) AS month
+    FROM dz_data_warehouse.digital_zone_users_local
+    GROUP BY customer_id
+),
+first_buyers_dedup AS (
+    SELECT customer_id, toStartOfMonth(MIN(created_at)) AS month
+    FROM dz_data_warehouse.digital_zone_customer_transactions_local
+    WHERE status = 'SUCCESS'
+    GROUP BY customer_id
+)
+SELECT 'signup'      AS type, month, count() AS n FROM signups_dedup      GROUP BY month
+UNION ALL
+SELECT 'first_buyer' AS type, month, count() AS n FROM first_buyers_dedup GROUP BY month
+ORDER BY type, month
+SETTINGS allow_experimental_analyzer = 1
+"""
+
 # %% [5] Q1 — Execute Core Metrics
 log.info("--- [5] Running Q1: Core Metrics ---")
 df_core = ch_client.query_df(Q1_SQL)
@@ -356,6 +377,36 @@ _null_rows = df_category["category_raw"].isna().sum()
 if _null_rows:
     log.warning(f"{_null_rows} rows with NULL category — excluded from category pivot")
 df_category["category"] = df_category["category_raw"].map(CATEGORY_MAP).fillna("Other")
+
+# %% [8b] Q5 — Execute Cumulative Signups & First Buyers
+log.info("--- [8b] Running Q5: All-time cumulative signups and first buyers ---")
+df_q5 = ch_client.query_df(Q5_SQL)
+df_q5.columns = [c.split('.')[-1] for c in df_q5.columns]
+log.info(f"Q5 result: {len(df_q5)} rows")
+
+_signups_hist  = df_q5[df_q5['type'] == 'signup'].set_index('month')['n'].sort_index()
+_firstbuy_hist = df_q5[df_q5['type'] == 'first_buyer'].set_index('month')['n'].sort_index()
+
+_all_months = pd.date_range(
+    start=min(_signups_hist.index.min(), _firstbuy_hist.index.min()),
+    end=max(_signups_hist.index.max(), _firstbuy_hist.index.max()),
+    freq='MS',
+)
+_signups_hist  = _signups_hist.reindex(_all_months, fill_value=0)
+_firstbuy_hist = _firstbuy_hist.reindex(_all_months, fill_value=0)
+
+_cum_signups   = _signups_hist.cumsum()
+_cum_first_buy = _firstbuy_hist.cumsum()
+
+# Key: 'YYYY-MM' string for fast lookup
+_cum_signups_dict   = {str(k)[:7]: float(v) for k, v in _cum_signups.items()}
+_cum_first_buy_dict = {str(k)[:7]: float(v) for k, v in _cum_first_buy.items()}
+
+log.info(
+    f"Cumulative series: signups up to {max(_cum_signups_dict)} = "
+    f"{_cum_signups_dict.get(max(_cum_signups_dict), 0):,.0f}, "
+    f"first buyers = {_cum_first_buy_dict.get(max(_cum_first_buy_dict), 0):,.0f}"
+)
 
 # %% [9] Derived Metrics
 log.info("--- [9] Computing derived metrics ---")
@@ -405,12 +456,22 @@ df_core["cust_existing_all_pct"]         = _pct_share(df_core["cust_existing_all
 df_core["cust_existing_retained_pct"]    = _pct_share(df_core["cust_existing_retained"],     df_core["cust_total"])
 df_core["cust_existing_reactivated_pct"] = _pct_share(df_core["cust_existing_reactivated"],  df_core["cust_total"])
 df_core["activation_rate"]               = _pct_share(df_core["cust_new_same_month"],        df_core["total_new_signups"])
-df_core["harvesting_activation_rate"]    = _pct_share(df_core["cust_new_prev_month"],        df_core["prev_month_non_buyers_from_signups"])
+df_core["cumulative_non_buyers"] = df_core["report_month"].apply(
+    lambda m: _cum_signups_dict.get(str(pd.Timestamp(m) - pd.DateOffset(months=1))[:7], float("nan"))
+            - _cum_first_buy_dict.get(str(pd.Timestamp(m) - pd.DateOffset(months=1))[:7], float("nan"))
+)
+df_core["harvesting_activation_rate"]    = _pct_share(
+    df_core["cust_new_prev_month"] + df_core["cust_harvested_new"],
+    df_core["cumulative_non_buyers"],
+)
 df_core["new_user_share"]                = _pct_share(df_core["cust_new_all"],               df_core["cust_total"])
 df_core["retention_rate"]                = _pct_share(df_core["cust_existing_retained"],     df_core["prev_month_total_buyers"])
+df_core["cum_buyers_prev_month"] = df_core["report_month"].apply(
+    lambda m: _cum_first_buy_dict.get(str(pd.Timestamp(m) - pd.DateOffset(months=1))[:7], float("nan"))
+)
 df_core["reactivation_rate"]             = _pct_share(
     df_core["cust_existing_reactivated"],
-    df_core["prev_month_total_buyers"] - df_core["cust_existing_retained"],
+    df_core["cum_buyers_prev_month"] - df_core["prev_month_total_buyers"],
 )
 
 log.debug(f"Rates (last 3):\n{df_core[['report_month','activation_rate','retention_rate','reactivation_rate']].tail(3)}")
