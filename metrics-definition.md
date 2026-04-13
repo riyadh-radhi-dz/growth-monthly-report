@@ -1,8 +1,4 @@
-# Growth Accounting Report — Metric Definitions
 
-Every metric in `output/growth_accounting_all_months.csv` is documented below: its definition, the mathematical formula, and the exact database tables and conditions used to compute it.
-
----
 
 ## Database Tables
 
@@ -504,20 +500,3 @@ Category Transactions %share[C, M] = Category Transactions[C, M] / Total Transac
 Category Users Growth[C, M]        = MoM% of Category Users[C]
 Category Users %share[C, M]        = Category Users[C, M]        / Total Buyers[M]        × 100
 ```
-
----
-
-## Appendix — Report Date Range & SQL Date Logic
-
-| Parameter | Value |
-|---|---|
-| `REPORT_START` | `2024-01-01` |
-| `REPORT_END` | `2026-04-01` (exclusive upper bound) |
-
-The core transaction CTE (`txns`) fetches one extra month on each side of the report window:
-- **Lower bound:** `REPORT_START - 1 month` — needed to determine whether January 2024 buyers purchased in December 2023 (for the `existing_retained` / `existing_reactivated` classification).
-- **Upper bound:** `REPORT_END + 1 month` — standard exclusive upper bound buffer.
-
-The final aggregation then filters back to `report_month >= REPORT_START AND report_month < REPORT_END`, so no out-of-window months appear in the output.
-
-The all-time cumulative queries (Q5) used for Harvesting Activation Rate and Reactivation Rate denominators have **no date filter** — they scan the full history of both tables to produce accurate lifetime totals.
