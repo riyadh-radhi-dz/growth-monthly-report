@@ -41,6 +41,7 @@ All revenue, transaction, and customer metrics are broken down by **customer seg
 - `COUNT(transactions | condition)` = total transaction rows meeting that condition
 - `MoM%` = Month-over-Month growth percentage
 - `%share` = percentage share relative to the all-segment total for that metric type
+- All percentage values (MoM% and %share) are rounded to **2 decimal places**. TPC is rounded to 1 decimal. RPU is rounded to the nearest whole number (IQD).
 
 ---
 
@@ -48,16 +49,19 @@ All revenue, transaction, and customer metrics are broken down by **customer seg
 
 ### Gross Sales (IQD)
 
-**Definition:** Total transaction value across all successful transactions in the month.
+**Definition:** Total transaction value across all successful transactions in the month, including the base product price, platform fees, and any donation amounts.
 
 **Formula:**
 ```
-Gross Sales = SUM(total_price)
+Gross Sales = SUM(total_price + fees + donation_amount)
               WHERE status = 'SUCCESS'
               AND report_month = M
 ```
 
+In SQL: `total_price + ifNull(fees, 0) + ifNull(donation_amount, 0)` is computed once in the `txns` CTE and flows into all revenue metrics automatically.
+
 **Source:** `digital_zone_customer_transactions_local`
+**Columns:** `total_price` (Float32), `fees` (Float32, default 0), `donation_amount` (Float32, default 0)
 **Filter:** `status = 'SUCCESS'`
 
 ---
@@ -134,12 +138,12 @@ rev_new_same_month = SUM(total_price | segment = new_same_month)
 
 ### Revenue from New Customers Prev Month
 
-**Definition:** Revenue from customers whose first purchase was in month M but who signed up in the previous month (M-1).
+**Definition:** Revenue from customers whose first purchase was in month M but who signed up in **any previous month** (M-1, M-2, or earlier). This includes both the immediately prior cohort (`new_prev_month`) and older dormant signups making their debut purchase (`harvested_new`).
 
 **Formula:**
 ```
-rev_new_prev_month = SUM(total_price | segment = new_prev_month)
-                   = SUM(total_price | first_purchase_month = M AND signup_month = M-1)
+rev_new_prev_month = SUM(total_price | segment IN (new_prev_month, harvested_new))
+                   = SUM(total_price | first_purchase_month = M AND signup_month < M)
 ```
 
 ---
@@ -250,11 +254,11 @@ Where:
 
 ### New User Share
 
-**Definition:** Proportion of total buyers in month M who are first-time buyers (across all new sub-segments).
+**Definition:** Proportion of total buyers in month M who are first-time buyers — both those who signed up and bought in the same month, and those who signed up in any prior month and made their first purchase this month.
 
 **Formula:**
 ```
-New User Share = (cust_new_all / cust_total) × 100
+New User Share = (cust_new_same_month + cust_new_prev_month + cust_harvested_new) / cust_total × 100
                = UNIQ(customer_id | segment IN (new_same_month, new_prev_month, harvested_new))
                  / UNIQ(customer_id)  × 100
 ```

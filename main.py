@@ -94,8 +94,8 @@ WITH
 txns AS (
     SELECT
         customer_id,
-        toStartOfMonth(created_at)  AS report_month,
-        total_price
+        toStartOfMonth(created_at)                                    AS report_month,
+        total_price + ifNull(fees, 0) + ifNull(donation_amount, 0)   AS total_price
     FROM dz_data_warehouse.digital_zone_customer_transactions_local
     WHERE status = 'SUCCESS'
       AND created_at >= '{_q1_raw_start}'
@@ -169,7 +169,7 @@ agg AS (
         report_month,
         sum(total_price)                                                                         AS gross_sales,
         sumIf(total_price, segment = 'new_same_month')                                          AS rev_new_same_month,
-        sumIf(total_price, segment = 'new_prev_month')                                          AS rev_new_prev_month,
+        sumIf(total_price, segment IN ('new_prev_month', 'harvested_new'))                      AS rev_new_prev_month,
         sumIf(total_price, first_purchase_month >= addMonths(report_month, -1))                 AS rev_new_all,
         sumIf(total_price, segment = 'existing_retained')                                       AS rev_existing_retained,
         sumIf(total_price, segment = 'existing_reactivated')                                    AS rev_existing_reactivated,
@@ -265,8 +265,8 @@ Q3_SQL = f"""
 WITH txns AS (
     SELECT
         customer_id,
-        toStartOfMonth(created_at) AS report_month,
-        total_price,
+        toStartOfMonth(created_at)                                    AS report_month,
+        total_price + ifNull(fees, 0) + ifNull(donation_amount, 0)   AS total_price,
         marketplace_name
     FROM dz_data_warehouse.digital_zone_customer_transactions_local
     WHERE status = 'SUCCESS'
@@ -289,8 +289,8 @@ Q4_SQL = f"""
 WITH txns AS (
     SELECT
         t.customer_id,
-        toStartOfMonth(t.created_at) AS report_month,
-        t.total_price,
+        toStartOfMonth(t.created_at)                                                  AS report_month,
+        t.total_price + ifNull(t.fees, 0) + ifNull(t.donation_amount, 0)             AS total_price,
         p.transformed_category
     FROM dz_data_warehouse.digital_zone_customer_transactions_local AS t
     LEFT JOIN dz_data_warehouse.digital_zone_products_local AS p
@@ -421,10 +421,10 @@ df_core = df_core.sort_values("report_month").reset_index(drop=True)
 
 def _mom(series: pd.Series) -> pd.Series:
     prior = series.shift(1)
-    return ((series - prior) / prior.abs() * 100).round(1)
+    return ((series - prior) / prior.abs() * 100).round(2)
 
 def _pct_share(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
-    return (numerator / denominator.replace(0, float("nan")) * 100).round(1)
+    return (numerator / denominator.replace(0, float("nan")) * 100).round(2)
 
 # Revenue MoM & % share
 df_core["gross_sales_mom"]               = _mom(df_core["gross_sales"])
