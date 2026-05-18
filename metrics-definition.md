@@ -81,21 +81,18 @@ Computed in Python from the monthly series.
 
 ### Revenue from New Customers
 
-**Definition:** Total revenue attributable to customers whose **first-ever purchase** occurred in month M **or** month M-1. This captures both customers making their debut purchase this month and customers who first purchased last month and are transacting again.
+**Definition:** Total revenue from customers whose **first-ever purchase** was in month M, regardless of when they signed up. Equals the sum of Revenue from New Customers Same Month and Revenue from New Customers Prev Month.
 
 **Formula:**
 ```
-Revenue from New Customers = SUM(total_price | first_purchase_month >= M-1)
-```
-
-In SQL:
-```sql
-sumIf(total_price, first_purchase_month >= addMonths(report_month, -1))
+Revenue from New Customers = rev_new_same_month + rev_new_prev_month
+                           = SUM(total_price | segment IN (new_same_month, new_prev_month, harvested_new))
 ```
 
 **Who is included:**
-- All customers in `new_same_month`, `new_prev_month`, `harvested_new` segments (first purchase = M)
-- `existing_retained` customers whose `first_purchase_month = M-1` (they first bought last month and bought again this month)
+- `new_same_month` — signed up and first bought in M
+- `new_prev_month` — signed up in M-1, first bought in M
+- `harvested_new` — signed up before M-1, first bought in M
 
 **Source:** `digital_zone_customer_transactions_local` + `digital_zone_users_local`
 **Filter:** `status = 'SUCCESS'`
@@ -202,11 +199,12 @@ cust_new_same_month = UNIQ(customer_id | segment = new_same_month)
 
 ### Total New Customers Prev Month
 
-**Definition:** Distinct count of customers making their first purchase in month M who signed up in M-1.
+**Definition:** Distinct count of customers making their first purchase in month M who signed up in **any previous month** (M-1, M-2, or earlier). Includes both the immediately prior cohort (`new_prev_month`) and older dormant signups finally activated (`harvested_new`).
 
 **Formula:**
 ```
-cust_new_prev_month = UNIQ(customer_id | segment = new_prev_month)
+cust_new_prev_month = UNIQ(customer_id | segment IN (new_prev_month, harvested_new))
+                    = UNIQ(customer_id | first_purchase_month = M AND signup_month < M)
 ```
 
 ---
@@ -228,14 +226,14 @@ Activation Rate = (cust_new_same_month[M] / Total New Signups[M]) × 100
 
 **Definition:** Percentage of the total cumulative non-buyer base (all users who ever registered but have never made a purchase, as of start of M) who were converted into first-time buyers in month M. Captures how effectively the platform activates its entire dormant registered user pool each month.
 
-**Numerator:** All first-time buyers in M who signed up **before** M — i.e., `new_prev_month` + `harvested_new`.
+**Numerator:** All first-time buyers in M who signed up **before** M — captured by `cust_new_prev_month`, which now includes both `new_prev_month` (signed up M-1) and `harvested_new` (signed up before M-1).
 
 **Denominator:** Cumulative count of users registered up to end of M-1 who have never made a purchase as of start of M.
 
 **Formula:**
 ```
 Harvesting Activation Rate =
-    (cust_new_prev_month[M] + cust_harvested_new[M])
+    cust_new_prev_month[M]
     / cumulative_non_buyers[M]  × 100
 
 cumulative_non_buyers[M] =
@@ -258,10 +256,10 @@ Where:
 
 **Formula:**
 ```
-New User Share = (cust_new_same_month + cust_new_prev_month + cust_harvested_new) / cust_total × 100
-               = UNIQ(customer_id | segment IN (new_same_month, new_prev_month, harvested_new))
-                 / UNIQ(customer_id)  × 100
+New User Share = (cust_new_same_month + cust_new_prev_month) / cust_total × 100
 ```
+
+Where `cust_new_prev_month` includes all prior-month signups (`new_prev_month` + `harvested_new`), so this covers every first-time buyer in M.
 
 ---
 
@@ -358,13 +356,16 @@ txn_new_same_month = COUNT(* | segment = new_same_month)
 
 ### Total Transactions New Customers Prev Month
 
+**Definition:** Transaction count from customers who signed up in any previous month and made their first purchase in M.
+
 ```
-txn_new_prev_month = COUNT(* | segment = new_prev_month)
+txn_new_prev_month = COUNT(* | segment IN (new_prev_month, harvested_new))
+                   = COUNT(* | first_purchase_month = M AND signup_month < M)
 ```
 
 ### Total Transactions Harvested New Customers
 
-**Definition:** Transaction count from customers whose first purchase is in M but who signed up 2+ months earlier (long-dormant sign-ups finally activated).
+**Definition:** Transaction count from customers whose first purchase is in M but who signed up 2+ months earlier (long-dormant sign-ups finally activated). This is a sub-breakdown of `txn_new_prev_month`.
 
 ```
 txn_harvested_new = COUNT(* | segment = harvested_new)

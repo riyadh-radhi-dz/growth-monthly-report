@@ -24,7 +24,7 @@ log.info("Growth Monthly Report — run started")
 load_dotenv()
 
 REPORT_START = "2024-01-01"
-REPORT_END   = "2026-04-01"
+REPORT_END   = "2026-05-01"
 
 # Derived bounds used in SQL
 _start = datetime.strptime(REPORT_START, "%Y-%m-%d")
@@ -170,20 +170,20 @@ agg AS (
         sum(total_price)                                                                         AS gross_sales,
         sumIf(total_price, segment = 'new_same_month')                                          AS rev_new_same_month,
         sumIf(total_price, segment IN ('new_prev_month', 'harvested_new'))                      AS rev_new_prev_month,
-        sumIf(total_price, first_purchase_month >= addMonths(report_month, -1))                 AS rev_new_all,
+        sumIf(total_price, segment IN ('new_same_month', 'new_prev_month', 'harvested_new'))    AS rev_new_all,
         sumIf(total_price, segment = 'existing_retained')                                       AS rev_existing_retained,
         sumIf(total_price, segment = 'existing_reactivated')                                    AS rev_existing_reactivated,
         sumIf(total_price, segment IN ('existing_retained', 'existing_reactivated'))            AS rev_existing_all,
         count()                                                                                  AS txn_total,
         countIf(segment = 'new_same_month')                                                     AS txn_new_same_month,
-        countIf(segment = 'new_prev_month')                                                     AS txn_new_prev_month,
+        countIf(segment IN ('new_prev_month', 'harvested_new'))                                AS txn_new_prev_month,
         countIf(segment = 'harvested_new')                                                      AS txn_harvested_new,
         countIf(segment IN ('new_same_month', 'new_prev_month', 'harvested_new'))               AS txn_new_all,
         countIf(segment = 'existing_retained')                                                  AS txn_existing_retained,
         countIf(segment = 'existing_reactivated')                                               AS txn_existing_reactivated,
         countIf(segment IN ('existing_retained', 'existing_reactivated'))                       AS txn_existing_all,
         uniqIf(customer_id, segment = 'new_same_month')                                         AS cust_new_same_month,
-        uniqIf(customer_id, segment = 'new_prev_month')                                         AS cust_new_prev_month,
+        uniqIf(customer_id, segment IN ('new_prev_month', 'harvested_new'))                     AS cust_new_prev_month,
         uniqIf(customer_id, segment = 'harvested_new')                                          AS cust_harvested_new,
         uniqIf(customer_id, segment IN ('new_same_month', 'new_prev_month', 'harvested_new'))   AS cust_new_all,
         uniqIf(customer_id, segment = 'existing_retained')                                      AS cust_existing_retained,
@@ -461,7 +461,7 @@ df_core["cumulative_non_buyers"] = df_core["report_month"].apply(
             - _cum_first_buy_dict.get(str(pd.Timestamp(m) - pd.DateOffset(months=1))[:7], float("nan"))
 )
 df_core["harvesting_activation_rate"]    = _pct_share(
-    df_core["cust_new_prev_month"] + df_core["cust_harvested_new"],
+    df_core["cust_new_prev_month"],
     df_core["cumulative_non_buyers"],
 )
 df_core["new_user_share"]                = _pct_share(df_core["cust_new_all"],               df_core["cust_total"])
@@ -667,7 +667,7 @@ log.info("--- [11] Exporting combined CSV ---")
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-out_path = OUTPUT_DIR / "growth_accounting_all_months.csv"
+out_path = OUTPUT_DIR / "growth_accounting_all_months_april.csv"
 df_out.to_csv(out_path, index=False, encoding="utf-8")
 _size_kb = out_path.stat().st_size / 1024
 log.info(f"Exported → {out_path.resolve()} ({_size_kb:.1f} KB)")
