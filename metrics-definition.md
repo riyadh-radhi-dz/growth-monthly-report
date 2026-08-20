@@ -39,9 +39,11 @@ All revenue, transaction, and customer metrics are broken down by **customer seg
 - `SUM(revenue | condition)` = sum of `total_price` for transactions meeting that condition
 - `UNIQ(customers | condition)` = distinct count of `customer_id` meeting that condition
 - `COUNT(transactions | condition)` = total transaction rows meeting that condition
-- `MoM%` = Month-over-Month growth percentage
+- `MoM%` = Month-over-Month growth percentage — `((X[M] - X[M-1]) / |X[M-1]|) × 100`
+- `YoY%` = Year-over-Year growth percentage — `((X[M] - X[M-12]) / |X[M-12]|) × 100`. Applied only to the **Global Calculations (Revenue)** rows. Blank for the first 12 months of the series (no prior-year value).
 - `%share` = percentage share relative to the all-segment total for that metric type
-- All percentage values (MoM% and %share) are rounded to **2 decimal places**. TPC is rounded to 1 decimal. RPU is rounded to the nearest whole number (IQD).
+- All percentage values (MoM%, YoY%, and %share) are rounded to **2 decimal places**. TPC is rounded to 1 decimal. RPU is rounded to the nearest whole number (IQD).
+- MoM and YoY are computed positionally within the displayed month series (via `shift`), so the leading month(s) of the reporting window carry blank growth.
 
 ---
 
@@ -76,6 +78,19 @@ Growth = ((Gross Sales[M] - Gross Sales[M-1]) / |Gross Sales[M-1]|) × 100
 ```
 
 Computed in Python from the monthly series.
+
+---
+
+### Revenue — YoY Growth %
+
+**Definition:** Year-over-Year percentage change, i.e. this month versus the same month one year earlier. Emitted as a `- YoY Growth %` sub-row for **every** Global Calculations revenue metric (Gross Sales, Revenue from New/Existing Customers and their sub-segments).
+
+**Formula:**
+```
+YoY% = ((Revenue[M] - Revenue[M-12]) / |Revenue[M-12]|) × 100
+```
+
+Computed in Python from the monthly series (`shift(12)`). Blank for the first 12 months of the window.
 
 ---
 
@@ -171,6 +186,19 @@ rev_existing_reactivated = SUM(total_price | segment = existing_reactivated)
 
 ## 2. Users
 
+### Total Active Customers
+
+**Definition:** Distinct count of buyers in month M that fall into a *classified* segment — i.e. all new buyers plus all existing buyers. Because it is the sum of the classified sub-segments, it **excludes** the `unknown` (no-signup-record) segment and is therefore smaller than `cust_total` (the unique-buyer count used as the `%share` denominator).
+
+**Formula:**
+```
+Total Active Customers = cust_new_all + cust_existing_all
+```
+
+> **Note:** This is *not* `cust_total`. `cust_total = UNIQ(customer_id)` over all successful transactions in M (including `unknown`) and remains the denominator for every Users `%share` row. The gap between the two shrinks over time as signup-data coverage improves (e.g. ~72k in Jan-2024, <1k by mid-2026).
+
+---
+
 ### Total New Signups
 
 **Definition:** Number of user accounts created in month M.
@@ -205,6 +233,18 @@ cust_new_same_month = UNIQ(customer_id | segment = new_same_month)
 ```
 cust_new_prev_month = UNIQ(customer_id | segment IN (new_prev_month, harvested_new))
                     = UNIQ(customer_id | first_purchase_month = M AND signup_month < M)
+```
+
+---
+
+### Total New Customers
+
+**Definition:** Blended distinct count of all first-time buyers in month M — same-month and prior-month cohorts combined. Emitted as a value-only row (no Growth/%share sub-rows in the template).
+
+**Formula:**
+```
+Total New Customers = cust_new_all
+                    = cust_new_same_month + cust_new_prev_month
 ```
 
 ---
@@ -310,6 +350,19 @@ Retention Rate = (cust_existing_retained[M] / prev_month_total_buyers[M]) × 100
 Where `prev_month_total_buyers[M]` = `UNIQ(customer_id)` from successful transactions in month M-1.
 
 **Source:** `digital_zone_customer_transactions_local`, `status = 'SUCCESS'`
+
+---
+
+### Total Inactive Base
+
+**Definition:** The full dormant buyer pool going into month M — every customer who has ever completed a purchase (up to end of M-1) but did **not** buy in M-1. This is the denominator of the Reactivation Rate, surfaced as its own row in the template (which shipped it blank).
+
+**Formula:**
+```
+total_inactive_base[M] = cumulative_all_time_first_buyers[M-1] − prev_month_total_buyers[M-1]
+```
+
+Where the two terms are as defined under Reactivation Rate below. In code this is `cum_buyers_prev_month − prev_month_total_buyers`.
 
 ---
 
@@ -459,7 +512,17 @@ RPU[segment] = SUM(total_price | segment) / UNIQ(customer_id | segment)
 | `pos-app` | `pos-app` |
 | `super-qi` | `super-qi` |
 
-Raw values not in the mapping are grouped as **Other**.
+Raw values not in the mapping are grouped as **Other**. In the current template layout no `Other` row is emitted — data falling outside the known platforms is dropped from the breakdown (a warning is logged so nothing is silently lost).
+
+**Display labels** (internal label → template label in the CSV):
+
+| Internal label | Template label |
+|---|---|
+| `third_party_merchant` | `Third Party Merchant` |
+| `standalone-digital-zone-app` | `Standalone Digital Zone App` |
+| `qi-services` | `Qi Services` |
+| `pos-app` | `POS App` |
+| `super-qi` | `Super Qi` |
 
 **Formulas per platform `P` and month `M`:**
 
@@ -489,7 +552,7 @@ Platform Users %share[P, M]        = Platform Users[P, M]        / Total Buyers[
 
 `donation`, `music-streaming`, `e-commerce`, `gsm`, `local-services`, `learning and bootcamps`, `security-software`, `isp-subscriptions`, `unidentified`, `local-entertainment`, `mobile-cards`, `gaming`, `video-streaming`, `social-media`
 
-The `concerts` category is excluded. Raw values not in the list are grouped as **Other**.
+The `concerts` category is excluded. Raw values not in the list are grouped as **Other** internally, but — as with platforms — no `Other` row is emitted in the template layout (a warning is logged instead). Category labels are printed as-is (lowercase). Breakdown `%share` is rounded to 2 decimals.
 
 **Formulas per category `C` and month `M`:**
 
@@ -505,3 +568,31 @@ Category Transactions %share[C, M] = Category Transactions[C, M] / Total Transac
 Category Users Growth[C, M]        = MoM% of Category Users[C]
 Category Users %share[C, M]        = Category Users[C, M]        / Total Buyers[M]        × 100
 ```
+
+---
+
+## 7. Output Template Format
+
+The CSV emitted by `main.py` mirrors the *Growth Accounting (IQD)* template exactly.
+
+**Reporting window** — driven by `REPORT_START` / `REPORT_END` at the top of `main.py` (`REPORT_END` is exclusive). Every month in the window becomes a column; the newest month is the last column. To reproduce and verify against the template, set the window to the full history; the run also fetches one month before `REPORT_START` (for M-1 segmentation) and the all-time cumulative series (for harvesting/reactivation).
+
+**Layout:**
+- **Column A** = metric label; **Column B** = blank gutter; **Columns C…** = months.
+- **Two header rows:** row 1 = month labels (`Mmm-YY`, e.g. `Jun-26`), row 2 = `Actuals` under each month.
+- **Section headers** (`Global Calculations`, `Users`, `Transactions`, `Unit Metrics`, `Breakdowns`) and **sub-headers** (`TPC - Transaction Per Customer`, `RPU - Revenue Per Customer`, each `… Breakdown - …`) are label-only rows with empty value cells.
+- **Sub-row labels:** `- MoM Growth`, `- YoY Growth %` (Revenue only), `- Growth` (Users/Transactions/Breakdowns), `- %share`.
+
+**Number formatting by section:**
+
+| Section | Value rows | Growth / %share |
+|---|---|---|
+| Global Calculations (Revenue) | comma-grouped integer | 2dp with `%` sign (e.g. `13.59%`) |
+| Users / Transactions | comma-grouped integer | 2dp, comma-grouped, no `%` (e.g. `-2.72`) |
+| Unit Metrics — TPC | 1dp (e.g. `2.6`) | — |
+| Unit Metrics — RPU | comma-grouped integer | — |
+| Breakdowns | comma-grouped integer | 2dp, comma-grouped, no `%` |
+
+Missing/uncomputable cells are left blank. Fields containing commas are quoted (standard CSV). Output file: `output/growth_accounting_<YYYY-MM>.csv`, named after the last month.
+
+> **Verification note:** revenue and transaction totals reproduce the template's historical columns to within rounding. Signup-derived metrics (Total New Signups and the new-customer segmentation downstream of it) can drift a few percent on older months because `digital_zone_users_local` has been backfilled/corrected since the template snapshot — this is source-data drift, not a calculation change. The template's most recent column may also contain forward-filled placeholder values in its derived (growth/rate) rows.
