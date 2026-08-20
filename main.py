@@ -1,4 +1,5 @@
 # %% [0] Imports
+import csv
 import logging
 import os
 import sys
@@ -23,8 +24,13 @@ log.info("Growth Monthly Report — run started")
 # %% [2] Config
 load_dotenv()
 
+# Data filter — display window. The output reproduces the template for every
+# month in [REPORT_START, REPORT_END) and appends the newest month as the last
+# column. Set to the full history to reproduce + verify against the template;
+# narrow it to regenerate a shorter span. MoM/YoY are computed within the series,
+# so the first month(s) of the window carry blank growth.
 REPORT_START = "2024-01-01"
-REPORT_END   = "2026-05-01"
+REPORT_END   = "2026-08-01"   # exclusive → last displayed month is Jun-2026
 
 # Derived bounds used in SQL
 _start = datetime.strptime(REPORT_START, "%Y-%m-%d")
@@ -69,6 +75,15 @@ CATEGORY_MAP: dict[str, str] = {
 
 PLATFORMS  = list(dict.fromkeys(PLATFORM_MAP.values()))  # ordered, deduped
 CATEGORIES = list(CATEGORY_MAP.values())
+
+# Platform display labels (internal label → Title-Case template label)
+PLATFORM_DISPLAY: dict[str, str] = {
+    "third_party_merchant":        "Third Party Merchant",
+    "standalone-digital-zone-app": "Standalone Digital Zone App",
+    "qi-services":                 "Qi Services",
+    "pos-app":                     "POS App",
+    "super-qi":                    "Super Qi",
+}
 
 log.info(f"Report window: {REPORT_START} → {REPORT_END}")
 log.info(f"Platforms ({len(PLATFORMS)}): {PLATFORMS}")
@@ -421,7 +436,13 @@ df_core = df_core.sort_values("report_month").reset_index(drop=True)
 
 def _mom(series: pd.Series) -> pd.Series:
     prior = series.shift(1)
-    return ((series - prior) / prior.abs() * 100).round(2)
+    out = (series - prior) / prior.abs() * 100
+    return out.replace([float("inf"), float("-inf")], float("nan")).round(2)
+
+def _yoy(series: pd.Series) -> pd.Series:
+    prior = series.shift(12)
+    out = (series - prior) / prior.abs() * 100
+    return out.replace([float("inf"), float("-inf")], float("nan")).round(2)
 
 def _pct_share(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return (numerator / denominator.replace(0, float("nan")) * 100).round(2)
@@ -440,6 +461,15 @@ df_core["rev_new_prev_month_pct"]        = _pct_share(df_core["rev_new_prev_mont
 df_core["rev_existing_all_pct"]          = _pct_share(df_core["rev_existing_all"],          df_core["gross_sales"])
 df_core["rev_existing_retained_pct"]     = _pct_share(df_core["rev_existing_retained"],     df_core["gross_sales"])
 df_core["rev_existing_reactivated_pct"]  = _pct_share(df_core["rev_existing_reactivated"],  df_core["gross_sales"])
+
+# Revenue YoY (Global Calculations section only)
+df_core["gross_sales_yoy"]               = _yoy(df_core["gross_sales"])
+df_core["rev_new_all_yoy"]               = _yoy(df_core["rev_new_all"])
+df_core["rev_existing_all_yoy"]          = _yoy(df_core["rev_existing_all"])
+df_core["rev_new_same_month_yoy"]        = _yoy(df_core["rev_new_same_month"])
+df_core["rev_new_prev_month_yoy"]        = _yoy(df_core["rev_new_prev_month"])
+df_core["rev_existing_retained_yoy"]     = _yoy(df_core["rev_existing_retained"])
+df_core["rev_existing_reactivated_yoy"]  = _yoy(df_core["rev_existing_reactivated"])
 
 log.debug(f"Revenue MoM (last 3):\n{df_core[['report_month','gross_sales','gross_sales_mom']].tail(3)}")
 
@@ -469,10 +499,18 @@ df_core["retention_rate"]                = _pct_share(df_core["cust_existing_ret
 df_core["cum_buyers_prev_month"] = df_core["report_month"].apply(
     lambda m: _cum_first_buy_dict.get(str(pd.Timestamp(m) - pd.DateOffset(months=1))[:7], float("nan"))
 )
+df_core["total_inactive_base"]           = (
+    df_core["cum_buyers_prev_month"] - df_core["prev_month_total_buyers"]
+)
 df_core["reactivation_rate"]             = _pct_share(
     df_core["cust_existing_reactivated"],
-    df_core["cum_buyers_prev_month"] - df_core["prev_month_total_buyers"],
+    df_core["total_inactive_base"],
 )
+
+# Total Active Customers = new (all) + existing (all) buyers. This excludes the
+# `unknown` (no-signup) segment, so it is smaller than cust_total — the latter
+# remains the denominator for the Users %share rows.
+df_core["cust_active"] = df_core["cust_new_all"] + df_core["cust_existing_all"]
 
 log.debug(f"Rates (last 3):\n{df_core[['report_month','activation_rate','retention_rate','reactivation_rate']].tail(3)}")
 
@@ -509,166 +547,180 @@ df_core["rpu_existing_reactivated"]  = (df_core["rev_existing_reactivated"] / df
 
 log.info(f"Derived metrics computed for {len(df_core)} months")
 
-# %% [10] Build Template DataFrame
+# %% [10] Build Template-Shaped Output
 log.info("--- [10] Building template-shaped output ---")
 
 df_core["month_label"] = pd.to_datetime(df_core["report_month"]).dt.strftime("%b-%y")
 month_cols = df_core["month_label"].tolist()
 log.info(f"Month columns ({len(month_cols)}): {month_cols}")
 
-def _row(label: str, col: str, df: pd.DataFrame = df_core) -> dict:
-    return {"Metric": label, **dict(zip(df["month_label"], df[col]))}
+# --- Value formatters (match the template's per-section conventions) ---
+def _finite(v) -> bool:
+    return pd.notna(v) and v not in (float("inf"), float("-inf"))
 
-rows: list[dict] = []
+def _f_int(v) -> str:                       # counts / IQD values: comma-grouped integer
+    return f"{v:,.0f}" if _finite(v) else ""
 
-# Revenue
-rows.append({"Metric": "Global Calculations"})
-rows.append(_row("Gross Sales (IQD)",                           "gross_sales"))
-rows.append(_row("  Growth",                                    "gross_sales_mom"))
-rows.append(_row("Revenue from New Customers",                  "rev_new_all"))
-rows.append(_row("  Growth",                                    "rev_new_all_mom"))
-rows.append(_row("  %share",                                    "rev_new_all_pct"))
-rows.append(_row("Revenue from Existing Customers",             "rev_existing_all"))
-rows.append(_row("  Growth",                                    "rev_existing_all_mom"))
-rows.append(_row("  %share",                                    "rev_existing_all_pct"))
-rows.append(_row("Revenue from New Customers Same Month",       "rev_new_same_month"))
-rows.append(_row("  Growth",                                    "rev_new_same_month_mom"))
-rows.append(_row("  %share",                                    "rev_new_same_month_pct"))
-rows.append(_row("Revenue from New Customers Prev Month",       "rev_new_prev_month"))
-rows.append(_row("  Growth",                                    "rev_new_prev_month_mom"))
-rows.append(_row("  %share",                                    "rev_new_prev_month_pct"))
-rows.append(_row("Revenue from Existing Retained Customers",    "rev_existing_retained"))
-rows.append(_row("  Growth",                                    "rev_existing_retained_mom"))
-rows.append(_row("  %share",                                    "rev_existing_retained_pct"))
-rows.append(_row("Revenue from Existing Reactivated Customers", "rev_existing_reactivated"))
-rows.append(_row("  Growth",                                    "rev_existing_reactivated_mom"))
-rows.append(_row("  %share",                                    "rev_existing_reactivated_pct"))
+def _f_pct(v) -> str:                        # Revenue growth/share: 2dp with % sign
+    return f"{v:.2f}%" if _finite(v) else ""
 
-# Users
-rows.append({"Metric": "Users"})
-rows.append(_row("Total New Signups",                           "total_new_signups"))
-rows.append(_row("  Growth",                                    "total_new_signups_mom"))
-rows.append(_row("Total New Customers Same Month",              "cust_new_same_month"))
-rows.append(_row("  Growth",                                    "cust_new_same_month_mom"))
-rows.append(_row("  %share",                                    "cust_new_same_month_pct"))
-rows.append(_row("Total New Customers Prev Month",              "cust_new_prev_month"))
-rows.append(_row("  Growth",                                    "cust_new_prev_month_mom"))
-rows.append(_row("  %share",                                    "cust_new_prev_month_pct"))
-rows.append(_row("Activation Rate",                             "activation_rate"))
-rows.append(_row("Harvesting Activation Rate",                  "harvesting_activation_rate"))
-rows.append(_row("New User Share",                              "new_user_share"))
-rows.append(_row("Total Existing Customers",                    "cust_existing_all"))
-rows.append(_row("  Growth",                                    "cust_existing_all_mom"))
-rows.append(_row("  %share",                                    "cust_existing_all_pct"))
-rows.append(_row("Total Existing Retained Customers",           "cust_existing_retained"))
-rows.append(_row("  Growth",                                    "cust_existing_retained_mom"))
-rows.append(_row("  %share",                                    "cust_existing_retained_pct"))
-rows.append(_row("Total Existing Reactivated Customers",        "cust_existing_reactivated"))
-rows.append(_row("  Growth",                                    "cust_existing_reactivated_mom"))
-rows.append(_row("  %share",                                    "cust_existing_reactivated_pct"))
-rows.append(_row("Retention Rate",                              "retention_rate"))
-rows.append(_row("Reactivation Rate",                           "reactivation_rate"))
+def _f_num(v) -> str:                         # other growth/share/rates: 2dp, comma-grouped
+    return f"{v:,.2f}" if _finite(v) else ""
 
-# Transactions
-rows.append({"Metric": "Transactions"})
-rows.append(_row("Total Transactions",                          "txn_total"))
-rows.append(_row("  Growth",                                    "txn_total_mom"))
-rows.append(_row("Total Transactions New Customers",            "txn_new_all"))
-rows.append(_row("  Growth",                                    "txn_new_all_mom"))
-rows.append(_row("  %share",                                    "txn_new_all_pct"))
-rows.append(_row("Total Transactions New Customers Same Month", "txn_new_same_month"))
-rows.append(_row("  Growth",                                    "txn_new_same_month_mom"))
-rows.append(_row("  %share",                                    "txn_new_same_month_pct"))
-rows.append(_row("Total Transactions New Customers Prev Month", "txn_new_prev_month"))
-rows.append(_row("  Growth",                                    "txn_new_prev_month_mom"))
-rows.append(_row("  %share",                                    "txn_new_prev_month_pct"))
-rows.append(_row("Total Transactions Harvested New Customers",  "txn_harvested_new"))
-rows.append(_row("  Growth",                                    "txn_harvested_new_mom"))
-rows.append(_row("  %share",                                    "txn_harvested_new_pct"))
-rows.append(_row("Total Transactions Existing Customers",       "txn_existing_all"))
-rows.append(_row("  Growth",                                    "txn_existing_all_mom"))
-rows.append(_row("  %share",                                    "txn_existing_all_pct"))
-rows.append(_row("Total Transactions Existing Retained",        "txn_existing_retained"))
-rows.append(_row("  Growth",                                    "txn_existing_retained_mom"))
-rows.append(_row("  %share",                                    "txn_existing_retained_pct"))
-rows.append(_row("Total Transactions Existing Reactivated",     "txn_existing_reactivated"))
-rows.append(_row("  Growth",                                    "txn_existing_reactivated_mom"))
-rows.append(_row("  %share",                                    "txn_existing_reactivated_pct"))
+def _f_num1(v) -> str:                          # rates shown to 1dp (e.g. Activation Rate)
+    return f"{v:,.1f}" if _finite(v) else ""
 
-# Unit Metrics
-rows.append({"Metric": "Unit Metrics"})
-rows.append(_row("TPC New Customers Blended",          "tpc_new_all"))
-rows.append(_row("TPC New Customers Same Month",        "tpc_new_same_month"))
-rows.append(_row("TPC New Customers Prev Month",        "tpc_new_prev_month"))
-rows.append(_row("TPC Existing Customers Blended",      "tpc_existing_all"))
-rows.append(_row("TPC Existing Retained Customers",     "tpc_existing_retained"))
-rows.append(_row("TPC Existing Reactivated Customers",  "tpc_existing_reactivated"))
-rows.append(_row("RPU New Customers Blended",           "rpu_new_all"))
-rows.append(_row("RPU New Customers Same Month",        "rpu_new_same_month"))
-rows.append(_row("RPU New Customers Prev Month",        "rpu_new_prev_month"))
-rows.append(_row("RPU Existing Customers Blended",      "rpu_existing_all"))
-rows.append(_row("RPU Existing Retained Customers",     "rpu_existing_retained"))
-rows.append(_row("RPU Existing Reactivated Customers",  "rpu_existing_reactivated"))
+def _f_tpc(v) -> str:                          # transactions per customer: 1dp
+    return f"{v:.1f}" if _finite(v) else ""
 
-# Platform Breakdown
-df_platform["month_label"] = pd.to_datetime(df_platform["report_month"]).dt.strftime("%b-%y")
-_gs  = dict(zip(df_core["month_label"], df_core["gross_sales"]))
-_tot_txn = dict(zip(df_core["month_label"], df_core["txn_total"]))
-_tot_cust = dict(zip(df_core["month_label"], df_core["cust_total"]))
+_FMT = {"int": _f_int, "pct": _f_pct, "num": _f_num, "num1": _f_num1, "tpc": _f_tpc}
 
-for section, val_col, denom in [
-    ("Platform Breakdown - Revenue",      "rev_platform",  _gs),
-    ("Platform Breakdown - Transactions", "txn_platform",  _tot_txn),
-    ("Platform Breakdown - Users",        "cust_platform", _tot_cust),
+out_rows: list[list[str]] = []
+_blank = ["" for _ in month_cols]
+
+def emit_header(label: str) -> None:
+    """Section / sub-section header: label only, empty value cells."""
+    out_rows.append([label, "", *_blank])
+
+def emit_series(label: str, series: dict, fmt: str) -> None:
+    f = _FMT[fmt]
+    out_rows.append([label, "", *[f(series.get(m, float("nan"))) for m in month_cols]])
+
+def emit_core(label: str, col: str, fmt: str) -> None:
+    emit_series(label, dict(zip(df_core["month_label"], df_core[col])), fmt)
+
+# --- Global Calculations (Revenue) — value + MoM + YoY (+ %share) ---
+emit_header("Global Calculations")
+emit_core("Gross Sales (IQD)",                    "gross_sales",              "int")
+emit_core("- MoM Growth",                         "gross_sales_mom",          "pct")
+emit_core("- YoY Growth %",                       "gross_sales_yoy",          "pct")
+for label, base in [
+    ("Revenue from New Customers",                  "rev_new_all"),
+    ("Revenue from Existing Customers",             "rev_existing_all"),
+    ("Revenue from New Customers Same Month",       "rev_new_same_month"),
+    ("Revenue from New Customers Prev Month",       "rev_new_prev_month"),
+    ("Revenue from Existing Retained Customers",    "rev_existing_retained"),
+    ("Revenue from Existing Reactivated Customers", "rev_existing_reactivated"),
 ]:
-    rows.append({"Metric": section})
-    for platform in PLATFORMS:
-        _df = df_platform[df_platform["platform"] == platform]
-        _pivot = dict(zip(_df["month_label"], _df[val_col]))
-        rows.append({"Metric": platform, **_pivot})
-        _series = pd.Series([_pivot.get(m, float("nan")) for m in month_cols])
-        rows.append({"Metric": "  Growth", **dict(zip(month_cols, _mom(_series).tolist()))})
-        rows.append({"Metric": "  %share", **{
-            m: round(_pivot.get(m, float("nan")) / denom.get(m, float("nan")) * 100, 1)
-            for m in month_cols
-        }})
-    log.debug(f"Built {section}")
+    emit_core(label,             base,           "int")
+    emit_core("- MoM Growth",    f"{base}_mom",  "pct")
+    emit_core("- YoY Growth %",  f"{base}_yoy",  "pct")
+    emit_core("- %share",        f"{base}_pct",  "pct")
 
-# Category Breakdown
+# --- Users ---
+emit_header("Users")
+emit_core("Total Active Customers",              "cust_active",                "int")
+emit_core("Total New Signups",                   "total_new_signups",          "int")
+emit_core("- Growth",                            "total_new_signups_mom",      "num")
+emit_core("Total New Customers",                 "cust_new_all",               "int")
+emit_core("Total New Customers Same Month",      "cust_new_same_month",        "int")
+emit_core("- Growth",                            "cust_new_same_month_mom",    "num")
+emit_core("- %share",                            "cust_new_same_month_pct",    "num")
+emit_core("Total New Customers Prev Month",      "cust_new_prev_month",        "int")
+emit_core("- Growth",                            "cust_new_prev_month_mom",    "num")
+emit_core("- %share",                            "cust_new_prev_month_pct",    "num")
+emit_core("Activation Rate",                     "activation_rate",            "num1")
+emit_core("Harvesting Activation Rate",          "harvesting_activation_rate", "num")
+emit_core("New User Share",                      "new_user_share",             "num")
+emit_core("Total Existing Customers",            "cust_existing_all",          "int")
+emit_core("- Growth",                            "cust_existing_all_mom",      "num")
+emit_core("- %share",                            "cust_existing_all_pct",      "num")
+emit_core("Total Existing Retained Customers",   "cust_existing_retained",     "int")
+emit_core("- Growth",                            "cust_existing_retained_mom", "num")
+emit_core("- %share",                            "cust_existing_retained_pct", "num")
+emit_core("Total Existing Reactivated Customers","cust_existing_reactivated",  "int")
+emit_core("- Growth",                            "cust_existing_reactivated_mom", "num")
+emit_core("- %share",                            "cust_existing_reactivated_pct", "num")
+emit_core("Retention Rate",                      "retention_rate",             "num")
+emit_core("Total Inactive Base",                 "total_inactive_base",        "int")
+emit_core("Reactivation Rate",                   "reactivation_rate",          "num")
+
+# --- Transactions ---
+emit_header("Transactions")
+emit_core("Total Transactions",                  "txn_total",                  "int")
+emit_core("- Growth",                            "txn_total_mom",              "num")
+for label, base in [
+    ("Total Transactions New Customers",              "txn_new_all"),
+    ("Total Transactions New Customers Same Month",   "txn_new_same_month"),
+    ("Total Transactions New Customers Prev Month",   "txn_new_prev_month"),
+    ("Total Transactions Harvested New Customers",    "txn_harvested_new"),
+    ("Total Transactions Existing Customers",         "txn_existing_all"),
+    ("Total Transactions Existing Retained Customers","txn_existing_retained"),
+    ("Total Transactions Existing Reactivated Customers", "txn_existing_reactivated"),
+]:
+    emit_core(label,          base,          "int")
+    emit_core("- Growth",     f"{base}_mom", "num")
+    emit_core("- %share",     f"{base}_pct", "num")
+
+# --- Unit Metrics ---
+emit_header("Unit Metrics")
+emit_header("TPC - Transaction Per Customer")
+emit_core("New Customers - Blended",            "tpc_new_all",                "tpc")
+emit_core("New Customers Same Month",           "tpc_new_same_month",         "tpc")
+emit_core("New Customers Prev Month",           "tpc_new_prev_month",         "tpc")
+emit_core("Existing Customers - Blended",       "tpc_existing_all",           "tpc")
+emit_core("Existing Retained Customers",        "tpc_existing_retained",      "tpc")
+emit_core("Existing Reactivated Customers",     "tpc_existing_reactivated",   "tpc")
+emit_header("RPU - Revenue Per Customer")
+emit_core("New Customers - Blended",            "rpu_new_all",                "int")
+emit_core("New Customers Same Month",           "rpu_new_same_month",         "int")
+emit_core("New Customers Prev Month",           "rpu_new_prev_month",         "int")
+emit_core("Existing Customers - Blended",       "rpu_existing_all",           "int")
+emit_core("Existing Retained Customers",        "rpu_existing_retained",      "int")
+emit_core("Existing Reactivated Customers",     "rpu_existing_reactivated",   "int")
+
+# --- Breakdowns (Platform & Category) ---
+df_platform["month_label"] = pd.to_datetime(df_platform["report_month"]).dt.strftime("%b-%y")
 df_category["month_label"] = pd.to_datetime(df_category["report_month"]).dt.strftime("%b-%y")
 
-for section, val_col, denom in [
-    ("Category Breakdown - Revenue",      "rev_category",  _gs),
-    ("Category Breakdown - Transactions", "txn_category",  _tot_txn),
-    ("Category Breakdown - Users",        "cust_category", _tot_cust),
-]:
-    rows.append({"Metric": section})
-    for cat in CATEGORIES:
-        _df = df_category[df_category["category"] == cat]
-        _pivot = dict(zip(_df["month_label"], _df[val_col]))
-        rows.append({"Metric": cat, **_pivot})
-        _series = pd.Series([_pivot.get(m, float("nan")) for m in month_cols])
-        rows.append({"Metric": "  Growth", **dict(zip(month_cols, _mom(_series).tolist()))})
-        rows.append({"Metric": "  %share", **{
-            m: round(_pivot.get(m, float("nan")) / denom.get(m, float("nan")) * 100, 1)
-            for m in month_cols
-        }})
+_gs       = dict(zip(df_core["month_label"], df_core["gross_sales"]))
+_tot_txn  = dict(zip(df_core["month_label"], df_core["txn_total"]))
+_tot_cust = dict(zip(df_core["month_label"], df_core["cust_total"]))
+
+def emit_breakdown(section, df, key_col, items, display_map, val_col, denom):
+    emit_header(section)
+    for item in items:
+        _df   = df[df[key_col] == item]
+        pivot = dict(zip(_df["month_label"], _df[val_col]))
+        vals  = {m: pivot.get(m, float("nan")) for m in month_cols}
+        label = display_map.get(item, item) if display_map else item
+        emit_series(label, vals, "int")
+        _series = pd.Series([vals[m] for m in month_cols], index=month_cols)
+        emit_series("- Growth", dict(zip(month_cols, _mom(_series).tolist())), "num")
+        share = {}
+        for m in month_cols:
+            d = denom.get(m, float("nan"))
+            share[m] = (vals[m] / d * 100) if (_finite(d) and d != 0 and _finite(vals[m])) else float("nan")
+        emit_series("- %share", share, "num")
     log.debug(f"Built {section}")
 
-df_out = pd.DataFrame(rows)
-for m in month_cols:
-    if m not in df_out.columns:
-        df_out[m] = float("nan")
+emit_header("Breakdowns")
+emit_breakdown("Platform Breakdown - Revenue",      df_platform, "platform", PLATFORMS, PLATFORM_DISPLAY, "rev_platform",  _gs)
+emit_breakdown("Platform Breakdown - Transactions", df_platform, "platform", PLATFORMS, PLATFORM_DISPLAY, "txn_platform",  _tot_txn)
+emit_breakdown("Platform Breakdown - Users",        df_platform, "platform", PLATFORMS, PLATFORM_DISPLAY, "cust_platform", _tot_cust)
+emit_breakdown("Category Breakdown - Revenue",      df_category, "category", CATEGORIES, None, "rev_category",  _gs)
+emit_breakdown("Category Breakdown - Transactions", df_category, "category", CATEGORIES, None, "txn_category",  _tot_txn)
+emit_breakdown("Category Breakdown - Users",        df_category, "category", CATEGORIES, None, "cust_category", _tot_cust)
 
-log.info(f"Template DataFrame built: {len(df_out)} rows × {len(df_out.columns)} cols")
+log.info(f"Template rows built: {len(out_rows)} rows × {len(month_cols) + 2} cols")
 
-# %% [11] Export CSV
+# %% [11] Export CSV (2-column gutter + 2-row header: months / Actuals)
 log.info("--- [11] Exporting combined CSV ---")
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-out_path = OUTPUT_DIR / "growth_accounting_all_months_april.csv"
-df_out.to_csv(out_path, index=False, encoding="utf-8")
+_last_ts = pd.to_datetime(df_core["report_month"]).max()
+out_path = OUTPUT_DIR / f"growth_accounting_{_last_ts:%Y-%m}.csv"
+
+header_months  = ["", "", *month_cols]
+header_actuals = ["", "", *["Actuals" for _ in month_cols]]
+
+with open(out_path, "w", newline="", encoding="utf-8") as fh:
+    writer = csv.writer(fh)                 # QUOTE_MINIMAL → wraps comma-bearing values
+    writer.writerow(header_months)
+    writer.writerow(header_actuals)
+    writer.writerows(out_rows)
+
 _size_kb = out_path.stat().st_size / 1024
 log.info(f"Exported → {out_path.resolve()} ({_size_kb:.1f} KB)")
 
